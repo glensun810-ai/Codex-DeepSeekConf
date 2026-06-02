@@ -1,0 +1,8 @@
+{
+  "_comment": "VS Code settings.json 中 Codex/DeepSeek 相关配置片段",
+  "_usage": "将这些配置合并到 ~/Library/Application Support/Code/User/settings.json",
+  "settings": {
+    "chatgpt.localeOverride": "zh-CN",
+    "chatgpt.openOnStartup": true
+  }
+}

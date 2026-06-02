@@ -1,0 +1,38 @@
+model = "deepseek-chat"
+model_provider = "deepseek-proxy"
+
+[model_providers.deepseek-proxy]
+name = "DeepSeek Proxy"
+base_url = "http://localhost:10204/v1"
+wire_api = "responses"
+
+[marketplaces.openai-bundled]
+last_updated = "2026-05-31T11:38:24Z"
+source_type = "local"
+source = "/Users/sgl/.codex/.tmp/bundled-marketplaces/openai-bundled"
+
+[desktop]
+localeOverride = "zh-CN"
+conversationDetailMode = "STEPS_PROSE"
+
+[desktop.open-in-target-preferences]
+global = "vscode"
+
+[desktop.open-in-target-preferences.perPath]
+"/Users/sgl/GEO" = "vscode"
+"/Users/sgl/PycharmProjects/CodexProject" = "pycharm"
+
+[projects."/Users/sgl/PycharmProjects/CodexProject"]
+trust_level = "trusted"
+
+[projects."/Users/sgl/Downloads/自动安装配置Codex"]
+trust_level = "trusted"
+
+[projects."/Users/sgl/Documents/工作/佛职院/27-盛路通信科技/02-数字孪生"]
+trust_level = "trusted"
+
+[projects."/Users/sgl/Documents/创业/进化湾/进化湾小程序方案"]
+trust_level = "trusted"
+
+[projects."/Users/sgl/Documents/创业/进化湾/AI课程开发"]
+trust_level = "trusted"

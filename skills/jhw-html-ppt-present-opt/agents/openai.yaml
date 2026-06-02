@@ -1,0 +1,4 @@
+interface:
+  display_name: "HTML演示增强工具包"
+  short_description: "为HTML演讲材料添加翻页画笔激光抓手缩放全屏白黑屏等演示操控功能"
+  default_prompt: "为这个HTML演讲材料添加上下左右翻页、画笔标注、激光笔、抓手拖动、全屏、白黑屏、缩放、右键菜单、快捷键帮助等功能"

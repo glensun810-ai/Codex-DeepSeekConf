@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Sensitive - ensure no real keys are committed
+*api_key=sk-*
+*AUTH_TOKEN=sk-*
+
+# Temp
+*.tmp
+*.bak

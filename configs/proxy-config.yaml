@@ -1,0 +1,35 @@
+server:
+  port: 10204
+  host: 0.0.0.0
+
+channels:
+  deepseek:
+    name: DeepSeek
+    base_url: https://api.deepseek.com
+    api_key: "sk-你的DeepSeek-API密钥"
+    timeout: 300
+    weight: 10
+    models:
+      - deepseek-chat
+      - deepseek-reasoner
+      - deepseek-v4-pro
+      - deepseek-v4-flash
+
+model_routing:
+  deepseek-chat:
+    channel: deepseek
+    model: deepseek-chat
+  deepseek-reasoner:
+    channel: deepseek
+    model: deepseek-reasoner
+  deepseek-v4-pro:
+    channel: deepseek
+    model: deepseek-v4-pro
+  deepseek-v4-flash:
+    channel: deepseek
+    model: deepseek-v4-flash
+  _default:
+    channel: deepseek
+    model: deepseek-chat
+
+log_level: INFO
