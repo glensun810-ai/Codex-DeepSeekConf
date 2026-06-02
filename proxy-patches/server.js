@@ -15,11 +15,35 @@ const fetch = undiciFetch;
 const upstreamPool = new Pool('https://api.deepseek.com', {
   connections: 16,
   pipelining: 1,
-  keepAliveTimeout: 60000,
+  keepAliveTimeout: 30000,
   keepAliveMaxTimeout: 300000,
   bodyTimeout: 300000,
   headersTimeout: 60000,
 });
+
+// ── fetch 重试包装：连接池中的空闲连接可能被服务端提前关闭 ──
+// 遇到连接错误时自动重试一次（使用新连接），消除间歇性 502
+async function fetchWithRetry(url, options, maxRetries = 1) {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fetch(url, options);
+    } catch (e) {
+      lastError = e;
+      // 仅对连接类错误重试（fetch failed、ECONNRESET、ETIMEDOUT 等）
+      const msg = e.message || '';
+      if (msg.includes('fetch failed') || msg.includes('ECONNRESET') || msg.includes('ETIMEDOUT') || msg.includes('UND_ERR')) {
+        if (attempt < maxRetries) {
+          // 短暂延迟后重试，给连接池时间清理死连接
+          await new Promise(r => setTimeout(r, 50 + Math.random() * 100));
+          continue;
+        }
+      }
+      throw e;
+    }
+  }
+  throw lastError;
+}
 
 // ── 并发控制器：限制同时发出的上游请求数，防止触发 API 限流 ──
 class ConcurrencyLimiter {
@@ -44,6 +68,160 @@ class ConcurrencyLimiter {
 }
 const upstreamLimiter = new ConcurrencyLimiter(10);
 
+// ═══════════════════════════════════════════════════════════════
+// 网络诊断：VPN 检测 + 上游可达性检查
+// ═══════════════════════════════════════════════════════════════
+
+const { execSync } = require('child_process');
+
+let _vpnCache = { checked: false, active: false, name: '', checkedAt: 0 };
+const VPN_CACHE_TTL = 30000; // 30 秒缓存
+
+function detectVPN() {
+  const now = Date.now();
+  if (_vpnCache.checked && (now - _vpnCache.checkedAt) < VPN_CACHE_TTL) {
+    return _vpnCache;
+  }
+
+  const result = { checked: true, active: false, name: '', checkedAt: now };
+
+  try {
+    // 方法 1: scutil --nc list（macOS 网络配置）
+    const ncList = execSync('scutil --nc list 2>/dev/null', {
+      encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 64,
+    });
+    const connectedMatch = ncList.match(/^\*\s+\(Connected\)\s+.+?VPN[^\n]*/m);
+    if (connectedMatch) {
+      result.active = true;
+      const nameMatch = connectedMatch[0].match(/"([^"]+)"/);
+      result.name = nameMatch ? nameMatch[1] : 'VPN (已连接)';
+    }
+    if (!result.active) {
+      // 方法 2: 检查是否有非回环的 tunnel 接口处于 active 状态
+      const ifconfig = execSync('ifconfig 2>/dev/null', {
+        encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 128,
+      });
+      const utunMatches = ifconfig.match(/^(utun\d+):.*\n(?:\s+.*\n)*?\s+inet\s+(\d+\.\d+\.\d+\.\d+)/gm);
+      if (utunMatches && utunMatches.length > 2) {
+        // utun0-utun2 通常是系统预留，超过 3 个活跃 utun 可能表示 VPN
+        const activeCount = utunMatches.length;
+        if (activeCount >= 5) {
+          result.active = true;
+          result.name = `检测到 ${activeCount} 个 tunnel 接口（VPN 可能处于活动状态）`;
+        }
+      }
+    }
+  } catch (e) {
+    // 检测失败不影响正常运行
+  }
+
+  _vpnCache = result;
+  return result;
+}
+
+async function checkUpstreamReachability(timeoutMs = 5000) {
+  const result = { reachable: false, latencyMs: 0, error: '', ip: '' };
+  const start = Date.now();
+
+  try {
+    // DNS 解析
+    const { lookup } = require('dns').promises;
+    const addresses = await lookup('api.deepseek.com', { all: true });
+    if (addresses && addresses.length > 0) {
+      result.ip = addresses[0].address;
+    }
+
+    // TCP 连通性测试
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+    const resp = await fetch('https://api.deepseek.com/v1/models', {
+      method: 'GET',
+      headers: {
+        'Authorization': 'Bearer ' + (getFirstApiKey() || 'test'),
+      },
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+
+    result.reachable = resp.ok || resp.status === 401; // 401 说明可达但鉴权问题
+    result.statusCode = resp.status;
+  } catch (e) {
+    result.error = e.message || 'Unknown error';
+    if (e.name === 'AbortError' || e.message?.includes('timeout')) {
+      result.error = '连接超时（可能 VPN 导致网络不通或防火墙阻止）';
+    } else if (e.message?.includes('ENOTFOUND') || e.message?.includes('getaddrinfo')) {
+      result.error = 'DNS 解析失败（可能 VPN 干扰了 DNS）';
+    } else if (e.message?.includes('ECONNREFUSED')) {
+      result.error = '连接被拒绝（目标服务器不可达或防火墙阻止）';
+    }
+  }
+
+  result.latencyMs = Date.now() - start;
+  return result;
+}
+
+// 从配置中提取第一个 API Key（用于连通性检测）
+let _getApiKeyFn = null;
+function getFirstApiKey() {
+  if (_getApiKeyFn) return _getApiKeyFn();
+  return null;
+}
+
+async function runStartupDiagnostics(config, logger) {
+  const issues = [];
+  const info = [];
+
+  // 1. VPN 检测
+  const vpn = detectVPN();
+  if (vpn.active) {
+    issues.push(`⚠️  VPN 已连接: ${vpn.name}`);
+    issues.push('   VPN 可能导致无法访问 DeepSeek API（国内服务）');
+    issues.push('   建议: 关闭 VPN 或配置分流规则，将 api.deepseek.com 走直连');
+  } else {
+    info.push('✓ VPN 状态: 未连接');
+  }
+
+  // 2. 上游可达性
+  const upstream = await checkUpstreamReachability();
+  if (upstream.reachable) {
+    info.push(`✓ DeepSeek API 可达 (${upstream.ip}, ${upstream.latencyMs}ms)`);
+  } else {
+    issues.push(`✗ DeepSeek API 不可达: ${upstream.error}`);
+    if (!vpn.active) {
+      issues.push('   建议: 检查网络连接或防火墙设置');
+    }
+  }
+
+  // 3. 输出诊断结果
+  const allLines = [...info, ...issues];
+  const maxLen = Math.max(...allLines.map(l => l.replace(/\x1b\[[0-9;]*m/g, '').length));
+  const sep = '─'.repeat(Math.min(maxLen + 4, 70));
+
+  console.log('');
+  console.log('  ' + sep);
+  console.log('  启动诊断');
+  console.log('  ' + sep);
+  for (const line of info) {
+    console.log('  ' + line);
+  }
+  for (const line of issues) {
+    console.log('  ' + line);
+  }
+  console.log('  ' + sep);
+
+  if (logger) {
+    logger.info('启动诊断完成', { vpn: vpn.active, upstream: upstream.reachable });
+  }
+
+  return { vpn, upstream, issues: issues.length };
+}
+
+// 暴露 API Key 获取函数给 runStartupDiagnostics
+function setApiKeyGetter(fn) {
+  _getApiKeyFn = fn;
+}
+
 function createApp(configPath) {
   const app = express();
   const config = new ConfigManager(configPath);
@@ -52,6 +230,16 @@ function createApp(configPath) {
   } catch (e) {
     console.error('[SERVER] 加载配置失败，使用默认配置:', e.message);
   }
+
+  // 注册 API Key 获取函数（供诊断模块使用）
+  setApiKeyGetter(() => {
+    const chKeys = Object.keys(config.channels || {});
+    if (chKeys.length > 0) {
+      return config.channels[chKeys[0]].api_key || null;
+    }
+    return null;
+  });
+
   // 配置文件监控：外部修改后自动重载
   config.startWatch();
   config.onReload(function() {
@@ -357,7 +545,7 @@ function createApp(configPath) {
     try {
       if (isStream) {
         // ---- 流式 ----
-        const upstreamResp = await upstreamLimiter.run(() => fetch(upstreamUrl, {
+        const upstreamResp = await upstreamLimiter.run(() => fetchWithRetry(upstreamUrl, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
           body: JSON.stringify(ccReq),
@@ -391,7 +579,7 @@ function createApp(configPath) {
         res.end();
       } else {
         // ---- 非流式 ----
-        const upstreamResp = await upstreamLimiter.run(() => fetch(upstreamUrl, {
+        const upstreamResp = await upstreamLimiter.run(() => fetchWithRetry(upstreamUrl, {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
           body: JSON.stringify(ccReq),
@@ -426,27 +614,48 @@ function createApp(configPath) {
     } catch (e) {
       config.recordError();
       const isTimeout = e.name === 'AbortError' || e.name === 'TimeoutError';
+      const isConnectError = !isTimeout && (e.message || '').includes('fetch failed');
       const logMethod = isTimeout ? 'warn' : 'error';
       logger[logMethod]('← 请求转发异常', { req: reqId, error: e.message, name: e.name || 'unknown' });
 
+      // 连接错误时检测 VPN 状态，给出明确诊断
+      let hint = null;
+      if (isConnectError) {
+        const vpn = detectVPN();
+        if (vpn.active) {
+          hint = '检测到 VPN 正在运行 (' + vpn.name + ')。VPN 可能导致无法访问 DeepSeek API（国内服务）。请关闭 VPN 后重试。';
+        } else {
+          hint = '无法连接到 DeepSeek API。请检查网络连接、防火墙设置，或运行 codex-diag 诊断。';
+        }
+      }
+
       if (!res.headersSent) {
         // 尚未发送响应头 → 可返回标准错误状态码
-        res.status(isTimeout ? 504 : 500).json({
+        const statusCode = isTimeout ? 504 : (isConnectError ? 502 : 500);
+        const errorBody = {
           error: {
             message: isTimeout ? '上游 API 响应超时' : e.message,
-            type: isTimeout ? 'timeout' : 'proxy_error',
-            code: isTimeout ? 'timeout' : 'internal_error',
+            type: isTimeout ? 'timeout' : (isConnectError ? 'upstream_unreachable' : 'proxy_error'),
+            code: isTimeout ? 'timeout' : (isConnectError ? 'upstream_unreachable' : 'internal_error'),
           }
-        });
+        };
+        if (hint) {
+          errorBody.error.hint = hint;
+        }
+        res.status(statusCode).json(errorBody);
       } else {
         // 流式传输中出错 → 发送 SSE error 事件后优雅关闭
+        const sseError = {
+          error: {
+            message: isTimeout ? '上游流式响应超时' : '流式传输中断',
+            type: isTimeout ? 'stream_timeout' : 'stream_error',
+          }
+        };
+        if (hint) {
+          sseError.error.hint = hint;
+        }
         try {
-          res.write('event: error\ndata: ' + JSON.stringify({
-            error: {
-              message: isTimeout ? '上游流式响应超时' : '流式传输中断',
-              type: isTimeout ? 'stream_timeout' : 'stream_error',
-            }
-          }) + '\n\n');
+          res.write('event: error\ndata: ' + JSON.stringify(sseError) + '\n\n');
         } catch (_) { /* socket 可能已关闭 */ }
         res.end();
       }
@@ -464,10 +673,11 @@ function createApp(configPath) {
   });
 
   // ============================================================
-  // GET /v1/health — 健康检查端点
+  // GET /v1/health — 健康检查端点（含 VPN/网络诊断）
   // ============================================================
   app.get('/v1/health', async (req, res) => {
-    const deep = req.query.deep === '1';
+    const deep = req.query.deep === '1' || req.query.deep === 'vpn';
+    const vpn = detectVPN();
     const result = {
       status: 'ok',
       uptime: Math.floor((Date.now() - config.stats.startTime) / 1000),
@@ -475,32 +685,28 @@ function createApp(configPath) {
       routes: Object.keys(config.modelRouting).length,
       requests: config.stats.totalRequests,
       errors: config.stats.totalErrors,
+      vpn: {
+        active: vpn.active,
+        name: vpn.name || null,
+        warning: vpn.active ? 'VPN 可能导致无法访问 DeepSeek API（国内服务）。建议关闭 VPN 或配置分流。' : null,
+      },
     };
+
+    // 如果 VPN 激活，自动调整状态
+    if (vpn.active) {
+      result.status = 'warning';
+    }
 
     if (deep) {
       // 深度检查：验证上游 API 可达性
-      const chCfg = config.channels['deepseek'];
-      if (chCfg) {
-        try {
-          const headers = buildUpstreamHeaders(chCfg);
-          const resp = await fetch(
-            (chCfg.base_url || '').replace(/\/+$/, '') + '/v1/chat/completions',
-            {
-              method: 'POST',
-              headers: { ...headers, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                model: 'deepseek-chat',
-                messages: [{ role: 'user', content: 'ping' }],
-                max_tokens: 1,
-                stream: false,
-              }),
-              signal: AbortSignal.timeout(10000),
-              dispatcher: upstreamPool,
-            }
-          );
-          result.upstream = { reachable: resp.ok, status: resp.status };
-        } catch (e) {
-          result.upstream = { reachable: false, error: e.message };
+      const upstream = await checkUpstreamReachability();
+      result.upstream = upstream;
+
+      if (!upstream.reachable) {
+        result.status = 'error';
+        result.hint = upstream.error;
+        if (vpn.active) {
+          result.hint = 'VPN 已连接 (' + vpn.name + ') 且 DeepSeek API 不可达。请先关闭 VPN 再重试。';
         }
       }
     }
@@ -508,7 +714,7 @@ function createApp(configPath) {
     res.json(result);
   });
 
-  return { app, config };
+  return { app, config, runStartupDiagnostics, detectVPN };
 }
 
 module.exports = createApp;
