@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Codex Proxy 管理面板 v2.0</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  [x-cloak] { display: none !important; }
+  .tab-btn { transition: all 0.15s ease; }
+  .tab-btn.active { color: #4f46e5; border-bottom: 2px solid #4f46e5; }
+  .card { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .status-dot.green { background: #22c55e; } .status-dot.red { background: #ef4444; } .status-dot.yellow { background: #eab308; }
+  .fade-in { animation: fadeIn 0.2s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  .toast { animation: slideIn 0.3s ease; }
+  @keyframes slideIn { from { opacity: 0; transform: translateX(100%); } to { opacity: 1; transform: translateX(0); } }
+  pre.config-block { background: #1e293b; color: #e2e8f0; padding: 16px; border-radius: 8px; font-size: 13px; overflow-x: auto; }
+</style>
+</head>
+<body class="bg-gray-50 min-h-screen" x-data="adminApp()" x-init="init()">
+<div x-cloak>
+
+<!-- ===== 顶部导航 ===== -->
+<header class="bg-white border-b border-gray-200 sticky top-0 z-30">
+  <div class="max-w-7xl mx-auto px-4 sm:px-6">
+    <div class="flex items-center justify-between h-14">
+      <div class="flex items-center space-x-1">
+        <span class="text-lg font-bold text-indigo-600 mr-4">⚡ Codex Proxy</span>
+        <span class="text-xs text-gray-400 hidden sm:inline">v2.0</span>
+      </div>
+      <div class="flex items-center space-x-2">
+        <span class="text-xs text-gray-500 hidden md:inline" x-text="'运行 ' + formatUptime(status.uptime)"></span>
+        <span class="status-dot" :class="status.proxy === 'running' ? 'green' : 'red'"></span>
+      </div>
+    </div>
+    <nav class="flex space-x-1 overflow-x-auto -mb-px">
+      <template x-for="tab in tabs" :key="tab.id">
+        <button @click="switchTab(tab.id)"
+          class="tab-btn px-3 py-2.5 text-sm font-medium whitespace-nowrap border-b-2"
+          :class="currentTab === tab.id ? 'active border-indigo-500 text-indigo-600' : 'border-transparent text-gray-500 hover:text-gray-700'"
+          x-text="tab.label"></button>
+      </template>
+    </nav>
+  </div>
+</header>
+
+<!-- ===== 主内容区 ===== -->
+<main class="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+
+  <!-- ═══ 仪表盘 ═══ -->
+  <div x-show="currentTab === 'dashboard'" class="fade-in space-y-6">
+    <div class="flex items-center justify-between">
+      <h2 class="text-xl font-semibold text-gray-800">📊 系统概览</h2>
+      <button @click="refreshDashboard()" class="text-sm text-indigo-600 hover:text-indigo-800">🔄 刷新</button>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3">
+      <div class="card p-4"><p class="text-xs text-gray-500 mb-1">代理状态</p><p class="text-lg font-semibold" :class="status.proxy==='running'?'text-green-600':'text-red-600'" x-text="status.proxy==='running'?'🟢 正常':'🔴 异常'"></p><p class="text-xs text-gray-400 mt-1" x-text="'端口 '+status.port"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500 mb-1">VPN 状态</p><p class="text-lg font-semibold" :class="status.vpn_active?'text-yellow-600':'text-green-600'" x-text="status.vpn_active?'⚠️ 已连接':'✅ 未连接'"></p><p class="text-xs text-gray-400 mt-1 truncate" x-text="status.vpn_name||'直连模式'"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500 mb-1">上游 API</p><p class="text-lg font-semibold" :class="status.upstream_reachable?'text-green-600':'text-red-600'" x-text="status.upstream_reachable?'🟢 可达':'🔴 不可达'"></p><p class="text-xs text-gray-400 mt-1" x-text="status.upstream_latency?status.upstream_latency+'ms':''"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500 mb-1">默认模型</p><p class="text-lg font-semibold text-indigo-600" x-text="status.default_model||'deepseek-chat'"></p><p class="text-xs text-gray-400 mt-1" x-text="status.models_count+' 个可用'"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500 mb-1">API 余额</p><p class="text-lg font-semibold" :class="status.balance_available?'text-green-600':'text-gray-400'" x-text="status.balance_amount||'查询中...'"></p><p class="text-xs text-gray-400 mt-1" x-text="status.balance_currency||''"></p></div>
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+      <div class="card p-4"><p class="text-xs text-gray-500">今日请求</p><p class="text-2xl font-bold text-gray-800" x-text="todayStats.requests||0"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500">错误率</p><p class="text-2xl font-bold" :class="(todayStats.error_rate||0)>0.05?'text-red-600':'text-green-600'" x-text="((todayStats.error_rate||0)*100).toFixed(2)+'%'"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500">Token 用量</p><p class="text-2xl font-bold text-gray-800" x-text="formatTokens((todayStats.tokens||{}).total||0)"></p></div>
+      <div class="card p-4"><p class="text-xs text-gray-500">平均延迟</p><p class="text-2xl font-bold text-gray-800" x-text="(todayStats.avg_latency_ms||0)+'ms'"></p></div>
+    </div>
+    <div class="card p-4"><h3 class="text-sm font-semibold text-gray-700 mb-3">Token 用量趋势（近 7 天）</h3><div class="h-48"><canvas id="tokenChart"></canvas></div></div>
+  </div>
+
+  <!-- ═══ 快速向导 ═══ -->
+  <div x-show="currentTab === 'wizard'" class="fade-in"><div class="max-w-2xl mx-auto">
+    <h2 class="text-xl font-semibold text-gray-800 mb-6">🚀 快速配置向导</h2>
+    <div class="flex items-center mb-8">
+      <template x-for="(step, idx) in wizard.steps" :key="step.id">
+        <div class="flex items-center flex-1"><div class="flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold" :class="wizard.current>=idx?'bg-indigo-600 text-white':'bg-gray-200 text-gray-500'" x-text="idx+1"></div><div class="flex-1 h-0.5 mx-1" :class="wizard.current>idx?'bg-indigo-600':'bg-gray-200'"></div></div>
+      </template>
+      <div class="flex items-center justify-center w-8 h-8 rounded-full text-sm font-bold" :class="wizard.current>=4?'bg-indigo-600 text-white':'bg-gray-200 text-gray-500'">✓</div>
+    </div>
+    <div x-show="wizard.current===0" class="card p-6 space-y-4"><h3 class="text-lg font-semibold">步骤 1：获取 DeepSeek API Key</h3><p class="text-gray-600 text-sm">访问 <a href="https://platform.deepseek.com/api_keys" target="_blank" class="text-indigo-600 underline">platform.deepseek.com/api_keys</a>，注册并创建 API Key。</p><div class="bg-blue-50 rounded-lg p-4 text-sm text-blue-700">💡 新用户注册即送 ¥10 免费额度。</div><div class="flex justify-end"><button @click="wizard.current=1" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">下一步 →</button></div></div>
+    <div x-show="wizard.current===1" class="card p-6 space-y-4"><h3 class="text-lg font-semibold">步骤 2：验证 API Key</h3><label class="block text-sm text-gray-600">粘贴你的 DeepSeek API Key：</label><input type="password" x-model="wizard.apiKey" class="w-full border rounded-lg px-4 py-2.5 text-sm focus:ring-2 focus:ring-indigo-300 outline-none" placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"><button @click="wizardVerifyKey()" :disabled="wizard.verifying" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50" x-text="wizard.verifying?'验证中...':'验证连通性'"></button><div x-show="wizard.verified" class="bg-green-50 rounded-lg p-4 text-sm space-y-1"><p class="text-green-700 font-semibold">✅ 验证通过！</p><p class="text-green-600" x-text="'余额: '+wizard.balance+' '+(wizard.balanceCurrency||'CNY')"></p><p class="text-green-600" x-text="'可用模型: '+(wizard.models||[]).join(', ')"></p></div><div x-show="wizard.verifyError" class="bg-red-50 rounded-lg p-4 text-sm text-red-600" x-text="wizard.verifyError"></div><div class="flex justify-between"><button @click="wizard.current=0" class="px-6 py-2 text-gray-600">← 上一步</button><button @click="wizard.current=2" :disabled="!wizard.verified" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-50">下一步 →</button></div></div>
+    <div x-show="wizard.current===2" class="card p-6 space-y-4"><h3 class="text-lg font-semibold">步骤 3：选择默认模型</h3><div class="space-y-2"><template x-for="m in wizard.availableModels" :key="m.id"><label class="flex items-center p-3 border rounded-lg cursor-pointer hover:bg-gray-50" :class="wizard.selectedModel===m.id?'border-indigo-400 bg-indigo-50':'border-gray-200'"><input type="radio" x-model="wizard.selectedModel" :value="m.id" class="mr-3"><div><p class="font-medium text-sm" x-text="m.name"></p><p class="text-xs text-gray-500" x-text="m.desc"></p></div></label></template></div><div class="flex justify-between"><button @click="wizard.current=1" class="px-6 py-2 text-gray-600">← 上一步</button><button @click="wizard.current=3" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">下一步 →</button></div></div>
+    <div x-show="wizard.current===3" class="card p-6 space-y-4"><h3 class="text-lg font-semibold">步骤 4：配置 Codex</h3><p class="text-sm text-gray-600">将以下内容复制到 <code class="bg-gray-100 px-1 rounded">~/.codex/config.toml</code>：</p><pre class="config-block" x-text="wizardCodexConfig()"></pre><div class="flex space-x-3"><button @click="copyToClipboard(wizardCodexConfig())" class="px-4 py-2 bg-gray-700 text-white rounded-lg text-sm hover:bg-gray-800">📋 一键复制</button></div><div x-show="wizard.copied" class="text-green-600 text-sm">✅ 已复制到剪贴板</div><div class="flex justify-between"><button @click="wizard.current=2" class="px-6 py-2 text-gray-600">← 上一步</button><button @click="wizard.current=4;refreshDashboard()" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">下一步 →</button></div></div>
+    <div x-show="wizard.current===4" class="card p-6 space-y-4"><h3 class="text-lg font-semibold">🎉 配置完成！</h3><div class="space-y-2 text-sm"><p :class="status.proxy==='running'?'text-green-600':'text-red-600'">代理状态: <span x-text="status.proxy==='running'?'✅ 运行中':'❌ 未运行'"></span></p><p :class="status.upstream_reachable?'text-green-600':'text-red-600'">上游 API: <span x-text="status.upstream_reachable?'✅ 可达':'❌ 不可达'"></span></p><p class="text-green-600">模型数量: <span x-text="status.models_count"></span> 个</p></div><p class="text-sm text-gray-600 mt-4">重启 Codex 应用后即可使用。</p><button @click="switchTab('dashboard')" class="px-6 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700">前往仪表盘 →</button></div>
+  </div></div>
+
+  <!-- ═══ 渠道管理 ═══ -->
+  <div x-show="currentTab === 'channels'" class="fade-in space-y-4">
+    <div class="flex items-center justify-between"><h2 class="text-xl font-semibold text-gray-800">📡 渠道管理</h2><button @click="openChannelModal()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">+ 添加渠道</button></div>
+    <template x-if="channels.length===0"><div class="card p-8 text-center text-gray-400">暂无渠道，点击"添加渠道"开始配置</div></template>
+    <template x-for="ch in channels" :key="ch.name">
+      <div class="card p-4 flex items-center justify-between"><div class="flex-1 min-w-0"><div class="flex items-center space-x-2"><span class="status-dot green"></span><span class="font-medium text-gray-800" x-text="ch.name"></span><span class="text-xs text-gray-400" x-text="'权重: '+(ch.weight||1)"></span></div><p class="text-xs text-gray-500 mt-1 truncate" x-text="ch.base_url"></p><p class="text-xs text-gray-400 mt-0.5"><span x-text="'Key: '+(ch.api_key||'').slice(0,8)+'***'+(ch.api_key||'').slice(-4)"></span><span class="mx-1">·</span><span x-text="'超时 '+(ch.timeout||300)+'s'"></span><span class="mx-1">·</span><span x-text="'模型: '+(ch.models||[]).join(', ')"></span></p></div><div class="flex items-center space-x-2 ml-4"><button @click="testChannel(ch.name)" class="px-3 py-1.5 text-xs rounded-lg border border-gray-200 hover:bg-gray-50">连通测试</button><button @click="openChannelModal(ch)" class="px-3 py-1.5 text-xs rounded-lg border border-gray-200 hover:bg-gray-50">编辑</button><button @click="deleteChannel(ch.name)" class="px-3 py-1.5 text-xs rounded-lg border border-red-200 text-red-600 hover:bg-red-50">删除</button></div></div>
+    </template>
+  </div>
+
+  <!-- ═══ 路由管理 ═══ -->
+  <div x-show="currentTab === 'routing'" class="fade-in space-y-4">
+    <div class="flex items-center justify-between"><h2 class="text-xl font-semibold text-gray-800">🔀 模型路由</h2><button @click="openRoutingModal()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">+ 添加路由</button></div>
+    <div class="card p-4 flex items-center justify-between"><div><span class="text-sm font-medium text-gray-800">默认路由</span><span class="ml-2 text-sm text-gray-500" x-text="defaultRouting.channel?defaultRouting.channel+(defaultRouting.model?' → '+defaultRouting.model:''):'(未设置)'"></span></div><button @click="openDefaultRoutingModal()" class="px-3 py-1.5 text-xs rounded-lg border border-gray-200 hover:bg-gray-50">设置</button></div>
+    <template x-if="routingEntries.length===0"><div class="card p-8 text-center text-gray-400">暂无路由规则</div></template>
+    <template x-for="r in routingEntries" :key="r.request_model"><div class="card p-4 flex items-center justify-between"><div><span class="font-medium text-sm text-gray-800" x-text="r.request_model"></span><span class="text-gray-400 mx-2">→</span><span class="text-sm text-gray-600" x-text="r.channel+' / '+r.actual_model"></span></div><div class="flex space-x-2"><button @click="openRoutingModal(r)" class="px-3 py-1.5 text-xs rounded-lg border border-gray-200 hover:bg-gray-50">编辑</button><button @click="deleteRouting(r.request_model)" class="px-3 py-1.5 text-xs rounded-lg border border-red-200 text-red-600 hover:bg-red-50">删除</button></div></div></template>
+    <div class="card p-4"><h3 class="text-sm font-semibold text-gray-700 mb-2">可用模型列表</h3><div class="flex flex-wrap gap-2"><template x-for="m in availableModels" :key="m.id"><span class="px-2.5 py-1 text-xs rounded-full" :class="m.type==='routing'?'bg-indigo-100 text-indigo-700':'bg-green-100 text-green-700'" x-text="m.id"></span></template><span x-show="availableModels.length===0" class="text-gray-400 text-sm">暂无</span></div></div>
+  </div>
+
+  <!-- ═══ 工具箱 ═══ -->
+  <div x-show="currentTab === 'tools'" class="fade-in space-y-6">
+    <h2 class="text-xl font-semibold text-gray-800">🛠️ 工具箱</h2>
+    <div class="card p-4 space-y-3"><h3 class="text-sm font-semibold text-gray-700">模型测试</h3><div class="flex flex-wrap gap-2"><select x-model="toolTest.model" class="border rounded-lg px-3 py-1.5 text-sm"><template x-for="m in availableModels" :key="m.id"><option :value="m.id" x-text="m.id"></option></template></select><label class="flex items-center text-sm"><input type="checkbox" x-model="toolTest.stream" class="mr-1">Stream</label></div><textarea x-model="toolTest.prompt" rows="2" class="w-full border rounded-lg px-3 py-2 text-sm" placeholder="输入测试消息..."></textarea><div class="flex items-center space-x-3"><button @click="runModelTest()" :disabled="toolTest.running" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 disabled:opacity-50" x-text="toolTest.running?'请求中...':'发送测试请求'"></button><span x-show="toolTest.result" class="text-sm text-green-600" x-text="'Token: in='+toolTest.result.input_tokens+' out='+toolTest.result.output_tokens+' | '+toolTest.result.latency_ms+'ms'"></span></div><div x-show="toolTest.result" class="bg-gray-50 rounded-lg p-3 text-sm text-gray-700 max-h-40 overflow-y-auto" x-text="toolTest.result.text"></div></div>
+    <div class="card p-4 space-y-3"><h3 class="text-sm font-semibold text-gray-700">网络诊断</h3><button @click="runDiag()" :disabled="diag.running" class="px-4 py-2 bg-gray-700 text-white rounded-lg text-sm hover:bg-gray-800 disabled:opacity-50" x-text="diag.running?'诊断中...':'运行诊断'"></button><div x-show="diag.result" class="space-y-1 text-sm"><p x-text="'VPN: '+(diag.result.vpn?.active?'⚠️ 已连接 ('+diag.result.vpn.name+')':'✅ 未连接')"></p><p x-text="'上游: '+(diag.result.upstream?.reachable?'✅ 可达 ('+diag.result.upstream.ip+', '+diag.result.upstream.latencyMs+'ms)':'❌ 不可达: '+(diag.result.upstream?.error||''))"></p><p x-text="'代理: ✅ 运行中 (PID '+diag.result.proxy?.pid+')'"></p></div></div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3"><button @click="refreshBalance()" class="card p-4 text-center hover:bg-gray-50"><span class="text-2xl">💰</span><p class="text-sm mt-1 text-gray-700">余额查询</p></button><button @click="exportConfig()" class="card p-4 text-center hover:bg-gray-50"><span class="text-2xl">📥</span><p class="text-sm mt-1 text-gray-700">导出配置</p></button><button @click="importConfigPrompt()" class="card p-4 text-center hover:bg-gray-50"><span class="text-2xl">📤</span><p class="text-sm mt-1 text-gray-700">导入配置</p></button><button @click="restartProxy()" class="card p-4 text-center hover:bg-red-50"><span class="text-2xl">🔄</span><p class="text-sm mt-1 text-red-600">重启代理</p></button></div>
+  </div>
+
+  <!-- ═══ 日志 ═══ -->
+  <div x-show="currentTab === 'logs'" class="fade-in space-y-4">
+    <div class="flex items-center justify-between flex-wrap gap-2"><h2 class="text-xl font-semibold text-gray-800">📋 请求日志</h2><div class="flex items-center space-x-2"><select x-model="logFilter.level" @change="loadLogs()" class="border rounded-lg px-3 py-1.5 text-sm"><option value="">全部级别</option><option value="INFO">INFO</option><option value="WARN">WARN</option><option value="ERROR">ERROR</option></select><button @click="loadLogs()" class="px-3 py-1.5 text-sm border rounded-lg hover:bg-gray-50">🔄</button><button @click="clearLogs()" class="px-3 py-1.5 text-sm border border-red-200 text-red-600 rounded-lg hover:bg-red-50">清空</button></div></div>
+    <div class="card overflow-x-auto"><table class="w-full text-sm"><thead><tr class="border-b text-left text-gray-500"><th class="px-4 py-2">时间</th><th class="px-4 py-2">级别</th><th class="px-4 py-2">消息</th></tr></thead><tbody><template x-for="entry in logEntries" :key="entry.id"><tr class="border-b hover:bg-gray-50"><td class="px-4 py-2 text-xs text-gray-400 whitespace-nowrap" x-text="entry.time"></td><td class="px-4 py-2"><span class="px-1.5 py-0.5 text-xs rounded-full" :class="entry.level==='ERROR'?'bg-red-100 text-red-700':entry.level==='WARN'?'bg-yellow-100 text-yellow-700':'bg-blue-100 text-blue-700'" x-text="entry.level"></span></td><td class="px-4 py-2 text-gray-700 truncate max-w-md" x-text="entry.msg"></td></tr></template></tbody></table><div x-show="logEntries.length===0" class="p-8 text-center text-gray-400">暂无日志</div></div>
+  </div>
+
+  <!-- ═══ 设置 ═══ -->
+  <div x-show="currentTab === 'settings'" class="fade-in space-y-6 max-w-xl">
+    <h2 class="text-xl font-semibold text-gray-800">⚙️ 设置</h2>
+    <div class="card p-4 space-y-3"><h3 class="text-sm font-semibold text-gray-700">服务器配置</h3><div class="grid grid-cols-2 gap-3"><div><label class="text-xs text-gray-500">端口</label><input type="number" x-model="settings.port" class="w-full border rounded-lg px-3 py-2 text-sm"></div><div><label class="text-xs text-gray-500">主机</label><input type="text" x-model="settings.host" class="w-full border rounded-lg px-3 py-2 text-sm"></div></div><div><label class="text-xs text-gray-500">日志级别</label><select x-model="settings.log_level" class="w-full border rounded-lg px-3 py-2 text-sm"><option>DEBUG</option><option>INFO</option><option>WARN</option><option>ERROR</option></select></div><button @click="saveSettings()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">保存设置</button></div>
+    <div class="card p-4 text-sm text-gray-500 space-y-1"><p>Codex Proxy v2.0</p><p>协议: OpenAI Responses API ↔ Chat Completions API</p><p>连接池: undici Pool (16 connections)</p><p>并发限制: 10 并行请求</p></div>
+  </div>
+
+</main>
+
+<!-- ═══ 渠道弹窗 ═══ -->
+<div x-show="showChannelModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30" @click.self="showChannelModal=false"><div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-lg mx-4 space-y-3"><h3 class="text-lg font-semibold" x-text="editingChannel?'编辑渠道':'添加渠道'"></h3><input type="text" x-model="channelForm.name" placeholder="渠道名称" class="w-full border rounded-lg px-3 py-2 text-sm"><input type="text" x-model="channelForm.base_url" placeholder="Base URL" class="w-full border rounded-lg px-3 py-2 text-sm"><input type="text" x-model="channelForm.api_key" placeholder="API Key" class="w-full border rounded-lg px-3 py-2 text-sm"><div class="grid grid-cols-2 gap-3"><input type="number" x-model="channelForm.timeout" placeholder="超时(秒)" class="border rounded-lg px-3 py-2 text-sm"><input type="number" x-model="channelForm.weight" placeholder="权重" class="border rounded-lg px-3 py-2 text-sm"></div><input type="text" x-model="channelForm.modelsStr" placeholder="模型列表 (逗号分隔)" class="w-full border rounded-lg px-3 py-2 text-sm"><div class="flex justify-end space-x-2 pt-2"><button @click="showChannelModal=false" class="px-4 py-2 text-sm text-gray-600">取消</button><button @click="saveChannel()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">保存</button></div></div></div>
+
+<!-- ═══ 路由弹窗 ═══ -->
+<div x-show="showRoutingModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/30" @click.self="showRoutingModal=false"><div class="bg-white rounded-xl shadow-xl p-6 w-full max-w-md mx-4 space-y-3"><h3 class="text-lg font-semibold" x-text="editingRouting?'编辑路由':'添加路由'"></h3><input type="text" x-model="routingForm.request_model" placeholder="请求模型名" class="w-full border rounded-lg px-3 py-2 text-sm"><input type="text" x-model="routingForm.channel" placeholder="渠道名称" class="w-full border rounded-lg px-3 py-2 text-sm"><input type="text" x-model="routingForm.actual_model" placeholder="实际模型名" class="w-full border rounded-lg px-3 py-2 text-sm"><div class="flex justify-end space-x-2 pt-2"><button @click="showRoutingModal=false" class="px-4 py-2 text-sm text-gray-600">取消</button><button @click="saveRouting()" class="px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700">保存</button></div></div></div>
+
+<!-- ═══ Toast ═══ -->
+<div class="fixed top-4 right-4 z-50 space-y-2"><template x-for="toast in toasts" :key="toast.id"><div class="toast px-4 py-3 rounded-lg shadow-lg text-sm text-white max-w-sm cursor-pointer" :class="toast.type==='success'?'bg-green-600':toast.type==='error'?'bg-red-600':'bg-gray-700'" @click="dismissToast(toast.id)" x-text="toast.msg"></div></template></div>
+
+</div>
+
+<script>
+function adminApp() {
+  const BASE = window.location.origin;
+  return {
+    currentTab: 'dashboard',
+    tabs: [
+      {id:'dashboard',label:'🏠 仪表盘'},{id:'wizard',label:'🚀 向导'},{id:'channels',label:'📡 渠道'},
+      {id:'routing',label:'🔀 路由'},{id:'tools',label:'🛠️ 工具'},{id:'logs',label:'📋 日志'},{id:'settings',label:'⚙️ 设置'},
+    ],
+    status: {proxy:'running',port:10204,uptime:0,vpn_active:false,vpn_name:'',upstream_reachable:false,upstream_latency:0,balance_available:false,balance_amount:'',balance_currency:'',models_count:0,default_model:''},
+    todayStats:{},tokenChart:null,toasts:[],toastId:0,
+
+    async init() {
+      const p = new URLSearchParams(location.search); if(p.get('wizard')==='1') this.currentTab='wizard';
+      await this.loadAll(); this.startSSE();
+      setInterval(()=>{if(this.currentTab==='dashboard')this.refreshDashboard()},30000);
+    },
+    async loadAll(){await Promise.all([this.refreshDashboard(),this.loadChannels(),this.loadRouting(),this.loadModels(),this.loadSettings()]);},
+    switchTab(id){this.currentTab=id;if(id==='dashboard'){this.refreshDashboard();this.initChart();}if(id==='logs')this.loadLogs();},
+
+    async refreshDashboard(){try{const r=await fetch(BASE+'/admin/api/dashboard');const d=await r.json();this.status.proxy=d.proxy?.status||'running';this.status.port=d.proxy?.port||10204;this.status.uptime=d.proxy?.uptime||0;this.status.vpn_active=d.vpn?.active||false;this.status.vpn_name=d.vpn?.name||'';this.status.upstream_reachable=d.upstream?.reachable||false;this.status.upstream_latency=d.upstream?.latencyMs||0;this.status.balance_available=d.balance?.available||false;this.status.balance_amount=d.balance?.available?('¥'+(d.balance?.total||'?')):'未配置';this.status.models_count=(d.active_models||[]).length;this.status.default_model=(d.active_models||[])[0]||'';this.todayStats=d.today||{};this.initChart();}catch(e){console.error(e);}},
+    async initChart(){setTimeout(async()=>{try{const r=await fetch(BASE+'/admin/api/stats/daily');const d=await r.json();const days=(d.days||[]).slice(-7);const ctx=document.getElementById('tokenChart');if(!ctx)return;if(this.tokenChart)this.tokenChart.destroy();this.tokenChart=new Chart(ctx,{type:'line',data:{labels:days.map(x=>x.date.slice(5)),datasets:[{label:'Input',data:days.map(x=>x.tokens_in||0),borderColor:'#6366f1',backgroundColor:'rgba(99,102,241,0.1)',fill:true,tension:0.3},{label:'Output',data:days.map(x=>x.tokens_out||0),borderColor:'#22c55e',backgroundColor:'rgba(34,197,94,0.1)',fill:true,tension:0.3}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{position:'bottom'}}}});}catch(_){}},100);},
+    startSSE(){try{const e=new EventSource(BASE+'/v1/events');e.addEventListener('status',e=>{const d=JSON.parse(e.data);this.status.proxy=d.proxy;this.status.vpn_active=d.vpn;this.status.uptime=d.uptime;});}catch(_){}},
+
+    wizard:{current:0,steps:[{id:'key',label:'获取 Key'},{id:'verify',label:'验证 Key'},{id:'model',label:'选择模型'},{id:'codex',label:'配置 Codex'},{id:'done',label:'完成'}],apiKey:'',verifying:false,verified:false,verifyError:'',balance:'',balanceCurrency:'',models:[],selectedModel:'deepseek-chat',copied:false,availableModels:[{id:'deepseek-chat',name:'DeepSeek Chat',desc:'通用对话模型，适用于日常编码对话和问答。'},{id:'deepseek-reasoner',name:'DeepSeek Reasoner',desc:'深度推理模型，支持 thinking 模式。'},{id:'deepseek-v4-pro',name:'DeepSeek V4 Pro',desc:'多模态旗舰模型，支持文本和图片输入。'},{id:'deepseek-v4-flash',name:'DeepSeek V4 Flash',desc:'极速轻量模型，适用于简单操作。'}]},
+    async wizardVerifyKey(){this.wizard.verifying=true;this.wizard.verifyError='';this.wizard.verified=false;try{const r=await fetch(BASE+'/admin/api/wizard/verify-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({api_key:this.wizard.apiKey})});const d=await r.json();if(d.ok){this.wizard.verified=true;this.wizard.balance=d.balance?.total||'?';this.wizard.balanceCurrency=d.balance?.currency||'CNY';this.wizard.models=d.models||[];await this.autoFillChannel(this.wizard.apiKey);}else{this.wizard.verifyError=d.error||'验证失败';}}catch(e){this.wizard.verifyError='网络错误: '+e.message;}this.wizard.verifying=false;},
+    async autoFillChannel(apiKey){try{await fetch(BASE+'/admin/api/channels',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'deepseek',base_url:'https://api.deepseek.com',api_key:apiKey,timeout:300,weight:10,models:['deepseek-chat','deepseek-reasoner','deepseek-v4-pro','deepseek-v4-flash']})});for(const m of['deepseek-chat','deepseek-reasoner','deepseek-v4-pro','deepseek-v4-flash']){try{await fetch(BASE+'/admin/api/routing',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({request_model:m,channel:'deepseek',actual_model:m})});}catch(_){}}try{await fetch(BASE+'/admin/api/routing/default',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:'deepseek',model:this.wizard.selectedModel})});}catch(_){}await this.loadChannels();await this.loadRouting();await this.loadModels();this.showToast('success','渠道和路由已自动配置！');}catch(_){}},
+    wizardCodexConfig(){return `model = "${this.wizard.selectedModel}"\nmodel_provider = "deepseek-proxy"\n\n[model_providers.deepseek-proxy]\nname = "DeepSeek Proxy"\nbase_url = "http://localhost:10204/v1"\nwire_api = "responses"`;},
+    async copyToClipboard(text){try{await navigator.clipboard.writeText(text);this.wizard.copied=true;setTimeout(()=>this.wizard.copied=false,3000);}catch(_){this.showToast('error','复制失败');}},
+
+    channels:[],showChannelModal:false,editingChannel:null,channelForm:{name:'',base_url:'',api_key:'',timeout:300,weight:10,modelsStr:''},
+    async loadChannels(){try{const r=await fetch(BASE+'/admin/api/channels');this.channels=await r.json();}catch(_){}},
+    openChannelModal(ch){this.editingChannel=ch||null;if(ch){this.channelForm={name:ch.name,base_url:ch.base_url,api_key:ch.api_key,timeout:ch.timeout||300,weight:ch.weight||10,modelsStr:(ch.models||[]).join(', ')};}else{this.channelForm={name:'',base_url:'',api_key:'',timeout:300,weight:10,modelsStr:''};}this.showChannelModal=true;},
+    async saveChannel(){const body={base_url:this.channelForm.base_url,api_key:this.channelForm.api_key,timeout:parseInt(this.channelForm.timeout)||300,weight:parseInt(this.channelForm.weight)||10,models:this.channelForm.modelsStr.split(',').map(s=>s.trim()).filter(Boolean)};const method=this.editingChannel?'PUT':'POST';const url=BASE+'/admin/api/channels'+(this.editingChannel?'/'+encodeURIComponent(this.editingChannel.name):'');try{await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});this.showChannelModal=false;await this.loadChannels();this.showToast('success','渠道已保存');}catch(e){this.showToast('error','保存失败');}},
+    async deleteChannel(name){if(!confirm('确定删除渠道 "'+name+'"？'))return;await fetch(BASE+'/admin/api/channels/'+encodeURIComponent(name),{method:'DELETE'});await this.loadChannels();this.showToast('success','渠道已删除');},
+    async testChannel(name){try{const r=await fetch(BASE+'/admin/api/test/'+encodeURIComponent(name),{method:'POST'});const d=await r.json();this.showToast(d.ok?'success':'error',d.ok?('✅ 连通正常'+(d.model?' ('+d.model+')':'')):'❌ '+(d.error||'测试失败'));}catch(_){}},
+
+    routingEntries:[],defaultRouting:{channel:'',model:null},availableModels:[],showRoutingModal:false,editingRouting:null,routingForm:{request_model:'',channel:'',actual_model:''},
+    async loadRouting(){try{const r=await fetch(BASE+'/admin/api/routing');const d=await r.json();this.routingEntries=d.entries||[];this.defaultRouting=d.default||{channel:'',model:null};}catch(_){}},
+    async loadModels(){try{const r=await fetch(BASE+'/admin/api/models');this.availableModels=await r.json();}catch(_){}},
+    openRoutingModal(r){this.editingRouting=r||null;this.routingForm=r?{request_model:r.request_model,channel:r.channel,actual_model:r.actual_model}:{request_model:'',channel:'',actual_model:''};this.showRoutingModal=true;},
+    async openDefaultRoutingModal(){const ch=prompt('默认渠道名称:',this.defaultRouting.channel||'deepseek');if(!ch)return;const m=prompt('默认模型（留空透传）:',this.defaultRouting.model||'deepseek-chat');try{await fetch(BASE+'/admin/api/routing/default',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({channel:ch,model:m||null})});await this.loadRouting();this.showToast('success','默认路由已保存');}catch(_){}},
+    async saveRouting(){const body={channel:this.routingForm.channel,actual_model:this.routingForm.actual_model,request_model:this.routingForm.request_model};const method=this.editingRouting?'PUT':'POST';const url=BASE+'/admin/api/routing'+(this.editingRouting?'/'+encodeURIComponent(this.editingRouting.request_model):'');try{await fetch(url,{method,headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});this.showRoutingModal=false;await this.loadRouting();await this.loadModels();this.showToast('success','路由已保存');}catch(e){this.showToast('error','保存失败');}},
+    async deleteRouting(model){if(!confirm('确定删除路由 "'+model+'"？'))return;await fetch(BASE+'/admin/api/routing/'+encodeURIComponent(model),{method:'DELETE'});await this.loadRouting();await this.loadModels();this.showToast('success','路由已删除');},
+
+    toolTest:{model:'deepseek-chat',stream:false,prompt:'你好，用一句话介绍北京',running:false,result:null},
+    diag:{running:false,result:null},
+    async runModelTest(){this.toolTest.running=true;this.toolTest.result=null;const start=Date.now();try{const r=await fetch(BASE+'/v1/responses',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:this.toolTest.model,input:[{role:'user',content:this.toolTest.prompt||'hi'}],stream:this.toolTest.stream,max_output_tokens:100})});const d=await r.json();const texts=[];for(const o of(d.output||[])){if(o.type==='message')for(const c of(o.content||[])){if(c.text)texts.push(c.text);}}this.toolTest.result={text:texts.join('')||'(无文本输出)',input_tokens:d.usage?.input_tokens||0,output_tokens:d.usage?.output_tokens||0,latency_ms:Date.now()-start};}catch(e){this.toolTest.result={text:'错误: '+e.message,input_tokens:0,output_tokens:0,latency_ms:Date.now()-start};}this.toolTest.running=false;},
+    async runDiag(){this.diag.running=true;this.diag.result=null;try{const r=await fetch(BASE+'/admin/api/diag');this.diag.result=await r.json();}catch(e){this.showToast('error','诊断失败');}this.diag.running=false;},
+    async refreshBalance(){try{const r=await fetch(BASE+'/admin/api/balance');const d=await r.json();if(d.ok&&d.is_available){const bi=d.balance_infos?.[0]||{};this.showToast('success','余额: '+bi.total_balance+' '+(bi.currency||'CNY'));}else{this.showToast('error',d.error||'余额查询失败');}}catch(e){this.showToast('error','查询失败');}},
+    async exportConfig(){try{const r=await fetch(BASE+'/admin/api/export',{method:'POST'});const d=await r.json();const blob=new Blob([JSON.stringify(d,null,2)],{type:'application/json'});const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download='codex-proxy-config-'+new Date().toISOString().slice(0,10)+'.json';a.click();URL.revokeObjectURL(url);this.showToast('success','配置已导出');}catch(_){}},
+    importConfigPrompt(){const input=document.createElement('input');input.type='file';input.accept='.json';input.onchange=async(e)=>{const file=e.target.files[0];if(!file)return;try{const text=await file.text();const data=JSON.parse(text);const r=await fetch(BASE+'/admin/api/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const d=await r.json();if(d.ok){this.showToast('success','配置已导入');await this.loadAll();}else{this.showToast('error','导入失败: '+(d.error||''));}}catch(e){this.showToast('error','无效配置文件');}};input.click();},
+    async restartProxy(){if(!confirm('确定要重启代理吗？'))return;try{await fetch(BASE+'/admin/api/restart',{method:'POST'});this.showToast('success','代理正在重启...');setTimeout(async()=>{for(let i=0;i<15;i++){await new Promise(r=>setTimeout(r,1000));try{const r=await fetch(BASE+'/admin/api/status');if(r.ok){this.showToast('success','代理已重启');await this.loadAll();return;}}catch(_){}}this.showToast('error','重启超时');},2000);}catch(e){this.showToast('error','重启失败');}},
+
+    logEntries:[],logFilter:{level:''},
+    async loadLogs(){try{const p=new URLSearchParams({limit:'100'});if(this.logFilter.level)p.set('level',this.logFilter.level);const r=await fetch(BASE+'/admin/api/logs?'+p);const d=await r.json();this.logEntries=(d.entries||[]).map(e=>({id:e.time+Math.random(),time:(e.time||'').slice(11,19)||'',level:e.level||'INFO',msg:e.msg||(typeof e.meta==='object'?JSON.stringify(e.meta).slice(0,120):'')}));}catch(_){}},
+    async clearLogs(){if(!confirm('确定清空日志？'))return;await fetch(BASE+'/admin/api/logs/clear',{method:'POST'});this.logEntries=[];this.showToast('success','日志已清空');},
+
+    settings:{port:10204,host:'0.0.0.0',log_level:'INFO'},
+    async loadSettings(){try{const[s,l]=await Promise.all([fetch(BASE+'/admin/api/server'),fetch(BASE+'/admin/api/settings')]);const sc=await s.json();const lc=await l.json();this.settings={port:sc.port||10204,host:sc.host||'0.0.0.0',log_level:lc.log_level||'INFO'};}catch(_){}},
+    async saveSettings(){try{await fetch(BASE+'/admin/api/server',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:parseInt(this.settings.port),host:this.settings.host})});await fetch(BASE+'/admin/api/settings',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({log_level:this.settings.log_level})});this.showToast('success','设置已保存（端口变更需重启生效）');}catch(_){}},
+
+    formatUptime(s){const h=Math.floor(s/3600),m=Math.floor((s%3600)/60);return h>0?h+'h '+m+'m':m+'m '+(s%60)+'s';},
+    formatTokens(n){if(n>=1e6)return(n/1e6).toFixed(1)+'M';if(n>=1e3)return(n/1e3).toFixed(1)+'K';return String(n);},
+    showToast(type,msg){const id=++this.toastId;this.toasts.push({id,type,msg});setTimeout(()=>this.dismissToast(id),4000);},
+    dismissToast(id){this.toasts=this.toasts.filter(t=>t.id!==id);},
+  };
+}
+</script>
+</body>
+</html>

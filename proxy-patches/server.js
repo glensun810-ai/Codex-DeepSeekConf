@@ -2,6 +2,9 @@
 
 const express = require('express');
 const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
 const { Pool, fetch: undiciFetch } = require('undici');
 const ConfigManager = require('./config');
 const Logger = require('./logger');
@@ -71,8 +74,6 @@ const upstreamLimiter = new ConcurrencyLimiter(10);
 // ═══════════════════════════════════════════════════════════════
 // 网络诊断：VPN 检测 + 上游可达性检查
 // ═══════════════════════════════════════════════════════════════
-
-const { execSync } = require('child_process');
 
 let _vpnCache = { checked: false, active: false, name: '', checkedAt: 0 };
 const VPN_CACHE_TTL = 30000; // 30 秒缓存
@@ -247,6 +248,81 @@ function createApp(configPath) {
   });
 
   const logger = new Logger({ logDir: config.configDir, level: config.logLevel || 'INFO' });
+
+  // ── 每日统计持久化 ──
+  const dailyStatsPath = path.join(config.configDir, 'daily_stats.json');
+  let dailyStats = [];
+  let todayStats = { date: new Date().toISOString().slice(0, 10), requests: 0, errors: 0, tokens_in: 0, tokens_out: 0, latency_sum: 0, latency_count: 0 };
+
+  function loadDailyStats() {
+    try {
+      if (fs.existsSync(dailyStatsPath)) {
+        dailyStats = JSON.parse(fs.readFileSync(dailyStatsPath, 'utf8'));
+        // 检查今天是否已存在
+        const today = new Date().toISOString().slice(0, 10);
+        const existing = dailyStats.find(d => d.date === today);
+        if (existing) {
+          todayStats = existing;
+        }
+      }
+    } catch (_) { dailyStats = []; }
+  }
+  loadDailyStats();
+
+  function saveDailyStats() {
+    const today = new Date().toISOString().slice(0, 10);
+    const idx = dailyStats.findIndex(d => d.date === today);
+    const entry = { ...todayStats };
+    if (idx >= 0) dailyStats[idx] = entry;
+    else dailyStats.push(entry);
+    // 只保留最近 90 天
+    if (dailyStats.length > 90) dailyStats = dailyStats.slice(-90);
+    try {
+      fs.writeFileSync(dailyStatsPath, JSON.stringify(dailyStats), 'utf8');
+    } catch (_) { /* 写入失败不影响运行 */ }
+  }
+
+  function recordRequestStats(inputTokens, outputTokens, latencyMs, isError) {
+    todayStats.requests++;
+    if (isError) todayStats.errors++;
+    todayStats.tokens_in += inputTokens || 0;
+    todayStats.tokens_out += outputTokens || 0;
+    if (latencyMs) {
+      todayStats.latency_sum += latencyMs;
+      todayStats.latency_count++;
+    }
+    // 每 10 次请求保存一次
+    if (todayStats.requests % 10 === 0) saveDailyStats();
+  }
+
+  function getTodayStats() {
+    const avgLatency = todayStats.latency_count > 0
+      ? Math.round(todayStats.latency_sum / todayStats.latency_count)
+      : 0;
+    return {
+      date: todayStats.date,
+      requests: todayStats.requests,
+      errors: todayStats.errors,
+      error_rate: todayStats.requests > 0 ? +(todayStats.errors / todayStats.requests).toFixed(4) : 0,
+      tokens: {
+        input: todayStats.tokens_in,
+        output: todayStats.tokens_out,
+        total: todayStats.tokens_in + todayStats.tokens_out,
+      },
+      avg_latency_ms: avgLatency,
+    };
+  }
+
+  function getDailyStats() {
+    // 确保今天的数据已更新
+    const today = new Date().toISOString().slice(0, 10);
+    const all = [...dailyStats];
+    const idx = all.findIndex(d => d.date === today);
+    const entry = { ...todayStats };
+    if (idx >= 0) all[idx] = entry;
+    else all.push(entry);
+    return all.slice(-30); // 最近 30 天
+  }
 
   app.use(express.json({ limit: '50mb' }));
 
@@ -453,10 +529,258 @@ function createApp(configPath) {
   });
 
   // ============================================================
+  // 管理 API：仪表盘聚合数据
+  // ============================================================
+  app.get('/admin/api/dashboard', async (req, res) => {
+    const now = Date.now();
+    const uptime = Math.floor((now - config.stats.startTime) / 1000);
+    const vpn = detectVPN();
+
+    // 上游可达性（缓存 30 秒）
+    const upstream = await checkUpstreamReachability();
+
+    // 余额查询（缓存 60 秒）
+    let balance = { available: false };
+    const chCfg = config.channels['deepseek'];
+    if (chCfg?.api_key && !chCfg.api_key.startsWith('sk-你的')) {
+      try {
+        const headers = buildUpstreamHeaders(chCfg);
+        const balResp = await fetch('https://api.deepseek.com/user/balance', {
+          headers,
+          signal: AbortSignal.timeout(8000),
+          dispatcher: upstreamPool,
+        });
+        const balData = await balResp.json();
+        if (balData.is_available) {
+          const bi = balData.balance_infos?.[0] || {};
+          balance = { available: true, total: bi.total_balance || '?', currency: bi.currency || 'CNY' };
+        }
+      } catch (_) { /* 静默失败 */ }
+    }
+
+    res.json({
+      proxy: { status: 'running', port: config.server.port || 10204, uptime },
+      vpn: { active: vpn.active, name: vpn.name || null },
+      upstream,
+      balance,
+      today: getTodayStats(),
+      channels: Object.keys(config.channels || {}).length,
+      routes: Object.keys(config.modelRouting || {}).length,
+      active_models: config.getAvailableModels().map(m => m.id),
+    });
+  });
+
+  // ============================================================
+  // GET /v1/events — SSE 实时事件流
+  // ============================================================
+  app.get('/v1/events', (req, res) => {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+
+    const clientId = genId('evt_');
+    logger.info('SSE 客户端连接', { client: clientId });
+
+    // 初始状态推送
+    const sendStatus = () => {
+      const vpn = detectVPN();
+      const uptime = Math.floor((Date.now() - config.stats.startTime) / 1000);
+      res.write(`event: status\ndata: ${JSON.stringify({
+        proxy: 'running', vpn: vpn.active, vpn_name: vpn.name,
+        requests: config.stats.totalRequests, errors: config.stats.totalErrors,
+        uptime,
+      })}\n\n`);
+    };
+    sendStatus();
+
+    // 心跳 + 状态更新（每 5 秒）
+    const heartbeat = setInterval(() => {
+      sendStatus();
+      res.write(`event: heartbeat\ndata: ${JSON.stringify({ time: new Date().toISOString() })}\n\n`);
+    }, 5000);
+
+    // 客户端断开时清理
+    req.on('close', () => {
+      clearInterval(heartbeat);
+      logger.info('SSE 客户端断开', { client: clientId });
+    });
+  });
+
+  // ============================================================
+  // 管理 API：每日统计
+  // ============================================================
+  app.get('/admin/api/stats/daily', (req, res) => {
+    res.json({ days: getDailyStats() });
+  });
+
+  // ============================================================
+  // 管理 API：向导验证 API Key
+  // ============================================================
+  app.post('/admin/api/wizard/verify-key', async (req, res) => {
+    const { api_key, base_url } = req.body;
+
+    if (!api_key) {
+      return res.status(400).json({ ok: false, error: '请提供 API Key' });
+    }
+
+    const targetUrl = (base_url || 'https://api.deepseek.com').replace(/\/+$/, '');
+
+    try {
+      // 验证余额
+      const balResp = await fetch(targetUrl + '/user/balance', {
+        headers: { 'Authorization': `Bearer ${api_key}` },
+        signal: AbortSignal.timeout(10000),
+        dispatcher: upstreamPool,
+      });
+      const balData = await balResp.json();
+
+      if (!balData.is_available) {
+        return res.json({ ok: false, error: 'API Key 无效或余额不可用' });
+      }
+
+      const bi = balData.balance_infos?.[0] || {};
+
+      // 获取模型列表
+      let models = [];
+      try {
+        const modelsResp = await fetch(targetUrl + '/v1/models', {
+          headers: { 'Authorization': `Bearer ${api_key}` },
+          signal: AbortSignal.timeout(8000),
+          dispatcher: upstreamPool,
+        });
+        const modelsData = await modelsResp.json();
+        models = (modelsData.data || []).map(m => m.id).filter(id =>
+          !id.includes('embedding') && !id.includes('moderation')
+        );
+      } catch (_) {
+        models = ['deepseek-chat', 'deepseek-reasoner'];
+      }
+
+      res.json({
+        ok: true,
+        balance: { total: bi.total_balance || '?', currency: bi.currency || 'CNY' },
+        models,
+      });
+    } catch (e) {
+      res.json({ ok: false, error: '无法连接到 API: ' + (e.message || '未知错误') });
+    }
+  });
+
+  // ============================================================
+  // 管理 API：网络诊断（JSON 格式）
+  // ============================================================
+  app.get('/admin/api/diag', async (req, res) => {
+    const vpn = detectVPN();
+    const upstream = await checkUpstreamReachability();
+    const proxyRunning = true;
+    const port = config.server.port || 10204;
+
+    const result = {
+      timestamp: new Date().toISOString(),
+      vpn,
+      proxy: { running: proxyRunning, port, pid: process.pid },
+      upstream,
+      config: {
+        channels: Object.keys(config.channels || {}).length,
+        routes: Object.keys(config.modelRouting || {}).length,
+        models: config.getAvailableModels().map(m => m.id),
+      },
+      stats: {
+        requests: config.stats.totalRequests,
+        errors: config.stats.totalErrors,
+        uptime: Math.floor((Date.now() - config.stats.startTime) / 1000),
+      },
+    };
+
+    res.json(result);
+  });
+
+  // ============================================================
+  // 管理 API：导出配置
+  // ============================================================
+  app.post('/admin/api/export', (req, res) => {
+    const exportData = {
+      exported_at: new Date().toISOString(),
+      version: '2.0',
+      server: config.server,
+      channels: config.channels,
+      model_routing: config.modelRouting,
+      default_routing: config.defaultRouting,
+      log_level: config.logLevel,
+    };
+    res.json(exportData);
+  });
+
+  // ============================================================
+  // 管理 API：导入配置
+  // ============================================================
+  app.post('/admin/api/import', (req, res) => {
+    try {
+      const data = req.body;
+      if (!data || typeof data !== 'object') {
+        return res.status(400).json({ ok: false, error: '无效的配置数据' });
+      }
+      if (data.server) config.server = { ...config.server, ...data.server };
+      if (data.channels && typeof data.channels === 'object') {
+        config.channels = data.channels;
+      }
+      if (data.model_routing && typeof data.model_routing === 'object') {
+        config.modelRouting = data.model_routing;
+      }
+      if (data.default_routing) {
+        config.defaultRouting = data.default_routing;
+      }
+      if (data.log_level) config.logLevel = data.log_level;
+      config.save();
+      logger.info('配置已导入并保存');
+      res.json({ ok: true });
+    } catch (e) {
+      res.status(500).json({ ok: false, error: e.message });
+    }
+  });
+
+  // ============================================================
+  // 管理 API：重启代理
+  // ============================================================
+  app.post('/admin/api/restart', (req, res) => {
+    res.json({ ok: true, message: '代理将在 1 秒后重启' });
+    logger.info('收到重启请求，即将退出进程...');
+    setTimeout(() => {
+      process.exit(0); // launchd KeepAlive 会自动重启
+    }, 1000);
+  });
+
+  // ============================================================
+  // 管理 API：余额查询
+  // ============================================================
+  app.get('/admin/api/balance', async (req, res) => {
+    const chCfg = config.channels['deepseek'];
+    if (!chCfg?.api_key || chCfg.api_key.startsWith('sk-你的')) {
+      return res.json({ ok: false, error: '未配置有效的 API Key' });
+    }
+    try {
+      const headers = buildUpstreamHeaders(chCfg);
+      const balResp = await fetch('https://api.deepseek.com/user/balance', {
+        headers,
+        signal: AbortSignal.timeout(10000),
+        dispatcher: upstreamPool,
+      });
+      const data = await balResp.json();
+      res.json({ ok: true, ...data });
+    } catch (e) {
+      res.json({ ok: false, error: e.message });
+    }
+  });
+
+  // ============================================================
   // Codex 代理核心：POST /v1/responses
   // ============================================================
   app.post('/v1/responses', async (req, res) => {
     const reqId = genId('req_');
+    const reqStart = Date.now();
     config.recordRequest();
     const reqBody = req.body;
     const originalModel = reqBody.model || '';
@@ -573,6 +897,7 @@ function createApp(configPath) {
         const respId = genId('resp_');
         await convertStream(upstreamResp, res, respId, originalModel, logger, reqBody, provider);
         logger.info('← 流式响应完成', { req: reqId, respId });
+        recordRequestStats(0, 0, Date.now() - reqStart, false);
         // 确保所有 SSE 事件已刷新到 TCP 缓冲区再关闭连接，
         // 避免客户端在收到最后一个 event 前检测到 FIN
         await new Promise(resolve => setTimeout(resolve, 300));
@@ -609,10 +934,15 @@ function createApp(configPath) {
           status: respObj.status,
         });
 
+        recordRequestStats(
+          respObj.usage.input_tokens, respObj.usage.output_tokens,
+          Date.now() - reqStart, false
+        );
         res.json(respObj);
       }
     } catch (e) {
       config.recordError();
+      recordRequestStats(0, 0, Date.now() - reqStart, true);
       const isTimeout = e.name === 'AbortError' || e.name === 'TimeoutError';
       const isConnectError = !isTimeout && (e.message || '').includes('fetch failed');
       const logMethod = isTimeout ? 'warn' : 'error';
